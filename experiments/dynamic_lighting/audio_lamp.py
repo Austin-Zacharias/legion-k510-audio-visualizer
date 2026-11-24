@@ -20,6 +20,7 @@ Press Ctrl+C to stop.
 import argparse
 import asyncio
 import colorsys
+from array import array
 import threading
 import time
 
@@ -159,7 +160,7 @@ async def main():
     # Height measured from the bottom row (assumes y grows downward)
     height = yn if args.flip_y else 1.0 - yn
     band_idx = np.minimum((xn * N_BANDS).astype(int), N_BANDS - 1)
-    indices = [l[0] for l in lamps]
+    indices = array("i", [l[0] for l in lamps])  # winsdk wants int arrays as buffers
     hues = xn * 0.8  # red -> purple across the keyboard
 
     cap = LoopbackCapture()

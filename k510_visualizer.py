@@ -60,16 +60,16 @@ FMIN, FMAX = 40, 14000
 BUF_SIZE = 4096
 
 # ---- Look & feel (tweak these) ----
-ATTACK = 0.50         # how fast bars rise (0-1, lower = calmer)
-DECAY = 0.90          # how slowly bars fall (closer to 1 = calmer)
-BEAT_RATIO = 1.4      # bass must exceed its recent average by this factor to count as a beat
+ATTACK = 0.60         # how fast bars rise (0-1, lower = calmer)
+DECAY = 0.88          # how slowly bars fall (closer to 1 = calmer)
+BEAT_RATIO = 1.22     # bass multiplier over average to count as a beat
 FLASH_STRENGTH = 0.95 # brightness of the whole-keyboard bass flash (0-1)
 FLASH_DECAY = 0.78    # how quickly the flash fades (closer to 1 = longer)
 HUE_STEP = 0.07       # how far the color shifts on each beat (0-1 around the color wheel)
 HUE_DRIFT = 0.002     # slow constant color drift per frame
 HUE_SPREAD = 0.25     # how much the color varies left to right
-IDLE_GLOW = 0.01      # faint glow on idle keys (0 = fully off)
-BAR_SCALE = 0.6       # bar height (1.0 = full keyboard height, 0.5 = about half)
+IDLE_GLOW = 0.02      # faint glow on idle keys (0 = fully off)
+BAR_SCALE = 0.95      # bar height (1.0 = full keyboard height reaches top row)
 
 # ripples mode
 RIPPLE_SPEED = 380    # how fast rings expand (mm per second)
@@ -202,7 +202,8 @@ def make_band_fn(rate):
     edges = np.geomspace(FMIN, FMAX, N_BANDS + 1)
     freqs = np.fft.rfftfreq(BUF_SIZE, 1.0 / rate)
     window = np.hanning(BUF_SIZE)
-    tilt = np.linspace(1.0, 4.0, N_BANDS)
+    # Balanced frequency weighting: ensure bass sub/kick frequencies are punchy
+    tilt = np.linspace(1.8, 1.3, N_BANDS)
 
     def band_levels(samples):
         spec = np.abs(np.fft.rfft(samples * window))
@@ -247,9 +248,11 @@ class Analyzer:
 
     def __init__(self, rate):
         self.band_levels = make_band_fn(rate)
-        self.peak = 1e-3
+        self.peaks = np.full(N_BANDS, 1e-3)
         self.smooth = np.zeros(N_BANDS)
         self.bass_avg = 0.0
+        self.bass_peak = 1e-3
+        self.bass_power = 0.0
         self.hue = 0.0
         self.flash = 0.0
         self.last_beat = 0.0
@@ -257,32 +260,48 @@ class Analyzer:
 
     def step(self, samples, now):
         lv = self.band_levels(samples)
-        self.peak = max(self.peak * 0.995, lv.max(), 1e-3)
-        norm = np.sqrt(np.clip(lv / self.peak, 0, 1))
+        # Per-band auto-gain: loud treble will never crush bass bands
+        self.peaks = np.maximum(self.peaks * 0.994, lv)
+        self.peaks = np.maximum(self.peaks, 1e-3)
+        norm = np.clip(lv / self.peaks, 0.0, 1.0)
+        norm = np.sqrt(norm)
+
         self.smooth = np.where(
             norm > self.smooth,
             self.smooth + (norm - self.smooth) * ATTACK,
             self.smooth * DECAY,
         )
 
-        bass = float(lv[:4].mean())
+        # Bass band: 40 Hz to ~200 Hz (first 7 bands)
+        bass = float(lv[:7].mean())
+        self.bass_peak = max(self.bass_peak * 0.994, bass, 1e-3)
+        norm_bass = np.clip(bass / self.bass_peak, 0.0, 1.0)
+
+        # Sustained bass drop energy
+        self.bass_power = self.bass_power * 0.88 + (norm_bass ** 1.3) * 0.12
+
         beat = False
-        if bass > self.bass_avg * BEAT_RATIO and bass > 0.2 * self.peak and now - self.last_beat > 0.18:
+        if bass > self.bass_avg * BEAT_RATIO and norm_bass > 0.18 and now - self.last_beat > 0.15:
             beat = True
             self.hue = (self.hue + HUE_STEP) % 1.0
             self.flash = 1.0
             self.last_beat = now
-        self.bass_avg = self.bass_avg * 0.93 + bass * 0.07
+
+        self.bass_avg = self.bass_avg * 0.92 + bass * 0.08
         self.flash *= FLASH_DECAY
         self.hue = (self.hue + HUE_DRIFT) % 1.0
-        self.vol = self.vol * 0.95 + float(np.clip(self.smooth.mean() * 1.8, 0, 1)) * 0.05
+        self.vol = self.vol * 0.95 + float(np.clip(self.smooth.mean() * 1.5, 0, 1)) * 0.05
         return beat
 
 
 def render_bars(an, c, beat, now, dt):
     level = an.smooth[c.band_idx] * BAR_SCALE
     bars = np.clip((level - c.height) * 4.0, 0.0, 1.0)
-    value = np.clip(np.maximum(bars, an.flash * FLASH_STRENGTH), IDLE_GLOW, 1.0)
+    # Bass rumble boost on the left side during sustained drops
+    bass_boost = np.where(c.xn < 0.38, an.bass_power * 0.45, 0.0)
+    value = np.clip(np.maximum(bars + bass_boost, an.flash * FLASH_STRENGTH), IDLE_GLOW, 1.0)
+    sat = 1.0 - 0.35 * an.flash  # flash goes slightly whiter
+    return hsv_arr(an.hue + c.xn * HUE_SPREAD, sat, value)
     sat = 1.0 - 0.35 * an.flash  # flash goes slightly whiter
     return hsv_arr(an.hue + c.xn * HUE_SPREAD, sat, value)
 

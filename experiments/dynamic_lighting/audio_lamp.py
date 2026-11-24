@@ -194,7 +194,8 @@ async def main():
                 r, g, bl = colorsys.hsv_to_rgb(h, 1.0, b)
                 colors.append(rgb(r * 255, g * 255, bl * 255))
 
-            la.set_colors_for_indices(colors, indices)
+            for idx, col in zip(indices, colors):
+                la.set_color_for_index(idx, col)
             await asyncio.sleep(max(0.0, 1.0 / FPS - (time.time() - t0)))
     except KeyboardInterrupt:
         pass

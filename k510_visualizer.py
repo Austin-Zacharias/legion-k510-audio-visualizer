@@ -3,7 +3,7 @@ Audio-reactive lighting for a HID LampArray keyboard (Lenovo Legion K510 Mini Pr
 talking to the keyboard directly over HID instead of through Windows Dynamic Lighting.
 
 Setup:
-    py -3.12 -m pip install hidapi numpy pyaudiowpatch
+    py -3.12 -m pip install hidapi numpy pyaudiowpatch keyboard
 
 Before running:
     - In Settings > Personalization > Dynamic lighting, turn OFF
@@ -20,6 +20,10 @@ Run:
     (--feature is no longer needed; updates always use feature reports)
     --complete-each                         # mark every report as a finished frame
     --delay 2                               # wait 2 ms between reports
+
+Hotkeys while it's running (work from any window):
+    Ctrl+Alt+Right / Ctrl+Alt+Left   next / previous mode
+    Ctrl+Alt+1 / 2 / 3 / 4           bars / ripples / sparkles / aurora
 
 Press Ctrl+C to stop (the keyboard returns to its normal lighting).
 """
@@ -342,6 +346,35 @@ MODES = {
 }
 
 
+def setup_hotkeys(state):
+    """Registers global hotkeys that change state['mode']. Optional: needs the 'keyboard' package."""
+    try:
+        import keyboard as kbd
+    except ImportError:
+        print("Hotkeys disabled (run: py -3.12 -m pip install keyboard)")
+        return None
+
+    names = list(MODES)
+
+    def step(delta):
+        i = names.index(state["mode"])
+        state["mode"] = names[(i + delta) % len(names)]
+
+    def pick(name):
+        state["mode"] = name
+
+    try:
+        kbd.add_hotkey("ctrl+alt+right", lambda: step(1))
+        kbd.add_hotkey("ctrl+alt+left", lambda: step(-1))
+        for i, name in enumerate(names[:9], start=1):
+            kbd.add_hotkey(f"ctrl+alt+{i}", lambda n=name: pick(n))
+    except Exception as e:
+        print(f"Hotkeys disabled ({e})")
+        return None
+    print("Hotkeys: Ctrl+Alt+Right/Left = next/previous mode, Ctrl+Alt+1-4 = pick a mode")
+    return kbd
+
+
 def run_audio(kb, pos, flip_y, mode):
     ids = sorted(pos)
     xs = np.array([pos[i][0] for i in ids], dtype=float) / 1000.0  # mm
@@ -355,7 +388,9 @@ def run_audio(kb, pos, flip_y, mode):
         height=height, band_idx=band_idx, state={},
     )
 
-    render = MODES[mode]
+    state = {"mode": mode}
+    current = mode
+    kbd = setup_hotkeys(state)
     cap = LoopbackCapture()
     an = Analyzer(cap.rate)
     frame = max(kb.min_interval, 1 / 30)
@@ -367,13 +402,22 @@ def run_audio(kb, pos, flip_y, mode):
             t0 = time.time()
             dt = t0 - last
             last = t0
+            if state["mode"] != current:
+                current = state["mode"]
+                c.state = {}  # reset the new mode's animation state
+                print("Mode:", current)
             beat = an.step(cap.snapshot(), t0)
-            rgb = np.clip(render(an, c, beat, t0, dt), 0.0, 1.0)
+            rgb = np.clip(MODES[current](an, c, beat, t0, dt), 0.0, 1.0)
             vals = (rgb * 255).astype(int)
             items = [(lid, int(r), int(g), int(b)) for lid, (r, g, b) in zip(ids, vals)]
             kb.update(items)
             time.sleep(max(0.0, frame - (time.time() - t0)))
     finally:
+        if kbd:
+            try:
+                kbd.unhook_all_hotkeys()
+            except Exception:
+                pass
         cap.close()
 
 

@@ -12,7 +12,10 @@ Before running:
 
 Run:
     py -3.12 k510_visualizer.py --test       # solid red, green, blue (checks control works)
-    py -3.12 k510_visualizer.py              # audio visualizer
+    py -3.12 k510_visualizer.py              # audio visualizer (bars mode)
+    py -3.12 k510_visualizer.py --mode ripples   # rings expand from random keys on each beat
+    py -3.12 k510_visualizer.py --mode sparkles  # calm glow with treble-driven twinkles
+    py -3.12 k510_visualizer.py --mode aurora    # slow flowing color waves that follow volume
     py -3.12 k510_visualizer.py --flip-y     # if the bars grow from the top
     (--feature is no longer needed; updates always use feature reports)
     --complete-each                         # mark every report as a finished frame
@@ -23,10 +26,12 @@ Press Ctrl+C to stop (the keyboard returns to its normal lighting).
 
 import argparse
 import colorsys
+import random
 import struct
 import sys
 import threading
 import time
+import types
 
 import numpy as np
 
@@ -51,16 +56,28 @@ FMIN, FMAX = 40, 14000
 BUF_SIZE = 4096
 
 # ---- Look & feel (tweak these) ----
-ATTACK = 0.55         # how fast bars rise (0-1, lower = calmer)
+ATTACK = 0.50         # how fast bars rise (0-1, lower = calmer)
 DECAY = 0.90          # how slowly bars fall (closer to 1 = calmer)
 BEAT_RATIO = 1.4      # bass must exceed its recent average by this factor to count as a beat
-FLASH_STRENGTH = 0.55 # brightness of the whole-keyboard bass flash (0-1)
-FLASH_DECAY = 0.88    # how quickly the flash fades (closer to 1 = longer)
+FLASH_STRENGTH = 0.95 # brightness of the whole-keyboard bass flash (0-1)
+FLASH_DECAY = 0.78    # how quickly the flash fades (closer to 1 = longer)
 HUE_STEP = 0.07       # how far the color shifts on each beat (0-1 around the color wheel)
 HUE_DRIFT = 0.002     # slow constant color drift per frame
 HUE_SPREAD = 0.25     # how much the color varies left to right
-IDLE_GLOW = 0.03      # faint glow on idle keys (0 = fully off)
+IDLE_GLOW = 0.01      # faint glow on idle keys (0 = fully off)
 BAR_SCALE = 0.6       # bar height (1.0 = full keyboard height, 0.5 = about half)
+
+# ripples mode
+RIPPLE_SPEED = 380    # how fast rings expand (mm per second)
+RIPPLE_WIDTH = 35     # thickness of each ring (mm)
+RIPPLE_LIFE = 1.6     # seconds before a ring fades out
+
+# sparkles mode
+SPARKLE_RATE = 7.0    # how many twinkles per frame at full treble
+SPARKLE_DECAY = 0.84  # how quickly twinkles fade (closer to 1 = longer)
+
+# aurora mode
+AURORA_SPEED = 0.12   # base speed of the flowing waves
 
 
 class Keyboard:
@@ -206,55 +223,155 @@ def run_test(kb, ids):
             time.sleep(kb.min_interval)
 
 
-def run_audio(kb, pos, flip_y):
+def hsv_arr(h, s, v):
+    """Vectorized HSV -> RGB. Inputs broadcast; returns an (n, 3) array of 0-1 floats."""
+    h, s, v = np.broadcast_arrays(np.asarray(h, float), np.asarray(s, float), np.asarray(v, float))
+    h6 = (h % 1.0) * 6.0
+    i = np.floor(h6).astype(int) % 6
+    f = h6 - np.floor(h6)
+    p = v * (1 - s)
+    q = v * (1 - f * s)
+    t = v * (1 - (1 - f) * s)
+    r = np.choose(i, [v, q, p, p, t, v])
+    g = np.choose(i, [t, v, v, q, p, p])
+    b = np.choose(i, [p, p, t, v, v, q])
+    return np.stack([r, g, b], axis=1)
+
+
+class Analyzer:
+    """Turns audio snapshots into smoothed band levels, beats, flash and a shifting hue."""
+
+    def __init__(self, rate):
+        self.band_levels = make_band_fn(rate)
+        self.peak = 1e-3
+        self.smooth = np.zeros(N_BANDS)
+        self.bass_avg = 0.0
+        self.hue = 0.0
+        self.flash = 0.0
+        self.last_beat = 0.0
+        self.vol = 0.0  # slow overall loudness, 0-1
+
+    def step(self, samples, now):
+        lv = self.band_levels(samples)
+        self.peak = max(self.peak * 0.995, lv.max(), 1e-3)
+        norm = np.sqrt(np.clip(lv / self.peak, 0, 1))
+        self.smooth = np.where(
+            norm > self.smooth,
+            self.smooth + (norm - self.smooth) * ATTACK,
+            self.smooth * DECAY,
+        )
+
+        bass = float(lv[:4].mean())
+        beat = False
+        if bass > self.bass_avg * BEAT_RATIO and bass > 0.2 * self.peak and now - self.last_beat > 0.18:
+            beat = True
+            self.hue = (self.hue + HUE_STEP) % 1.0
+            self.flash = 1.0
+            self.last_beat = now
+        self.bass_avg = self.bass_avg * 0.93 + bass * 0.07
+        self.flash *= FLASH_DECAY
+        self.hue = (self.hue + HUE_DRIFT) % 1.0
+        self.vol = self.vol * 0.95 + float(np.clip(self.smooth.mean() * 1.8, 0, 1)) * 0.05
+        return beat
+
+
+def render_bars(an, c, beat, now, dt):
+    level = an.smooth[c.band_idx] * BAR_SCALE
+    bars = np.clip((level - c.height) * 4.0, 0.0, 1.0)
+    value = np.clip(np.maximum(bars, an.flash * FLASH_STRENGTH), IDLE_GLOW, 1.0)
+    sat = 1.0 - 0.35 * an.flash  # flash goes slightly whiter
+    return hsv_arr(an.hue + c.xn * HUE_SPREAD, sat, value)
+
+
+def render_ripples(an, c, beat, now, dt):
+    rings = c.state.setdefault("rings", [])
+    if beat:
+        k = random.randrange(c.n)
+        rings.append((now, c.xmm[k], c.ymm[k], an.hue, 0.7 + 0.3 * an.flash))
+        del rings[:-8]
+    rings[:] = [r for r in rings if now - r[0] < RIPPLE_LIFE]
+
+    rgb = np.tile(np.array(colorsys.hsv_to_rgb(an.hue, 1.0, IDLE_GLOW)), (c.n, 1))
+    for t0, ox, oy, hue, amp in rings:
+        age = now - t0
+        radius = RIPPLE_SPEED * age
+        dist = np.hypot(c.xmm - ox, c.ymm - oy)
+        val = np.exp(-(((dist - radius) / RIPPLE_WIDTH) ** 2)) * (1.0 - age / RIPPLE_LIFE) * amp
+        rgb += val[:, None] * np.array(colorsys.hsv_to_rgb(hue, 1.0, 1.0))
+    return np.clip(rgb, 0.0, 1.0)
+
+
+def render_sparkles(an, c, beat, now, dt):
+    spark = c.state.setdefault("spark", np.zeros(c.n))
+    spark *= SPARKLE_DECAY
+    treble = float(an.smooth[-8:].mean())
+    spawn = int(np.random.poisson(SPARKLE_RATE * treble ** 2))
+    if beat:
+        spawn += 3
+    if spawn:
+        spark[np.random.randint(0, c.n, spawn)] = 1.0
+
+    base_v = max(IDLE_GLOW, 0.06 + 0.25 * an.vol + 0.2 * an.flash)
+    base = hsv_arr(an.hue + c.xn * HUE_SPREAD, 0.9, base_v)
+    glow = spark[:, None] * np.array([1.0, 0.95, 0.9])
+    return np.clip(base + glow, 0.0, 1.0)
+
+
+def render_aurora(an, c, beat, now, dt):
+    st = c.state
+    st["phase"] = st.get("phase", 0.0) + dt * (AURORA_SPEED + 0.5 * an.vol)
+    p = st["phase"]
+    tau = 2 * np.pi
+    hue_base = 0.62 + 0.18 * np.sin(p * 0.35)
+    hue = (
+        hue_base
+        + 0.10 * np.sin(tau * (c.xn * 0.8 + p * 0.4))
+        + 0.06 * np.sin(tau * (c.yn * 1.1 - p * 0.3))
+    )
+    wave = 0.5 + 0.5 * np.sin(tau * (c.xn * 1.1 + p * 0.5) + 2.0 * np.sin(tau * c.yn * 0.7 + p * 1.3))
+    loud = 0.35 + 0.65 * min(1.0, an.vol * 1.6)
+    value = np.clip((0.08 + 0.92 * wave) * loud + an.flash * 0.25, IDLE_GLOW, 1.0)
+    return hsv_arr(hue, 0.85, value)
+
+
+MODES = {
+    "bars": render_bars,
+    "ripples": render_ripples,
+    "sparkles": render_sparkles,
+    "aurora": render_aurora,
+}
+
+
+def run_audio(kb, pos, flip_y, mode):
     ids = sorted(pos)
-    xs = np.array([pos[i][0] for i in ids], dtype=float)
-    ys = np.array([pos[i][1] for i in ids], dtype=float)
-    xn = (xs - xs.min()) / max(xs.max() - xs.min(), 1.0)
-    yn = (ys - ys.min()) / max(ys.max() - ys.min(), 1.0)
+    xs = np.array([pos[i][0] for i in ids], dtype=float) / 1000.0  # mm
+    ys = np.array([pos[i][1] for i in ids], dtype=float) / 1000.0
+    xn = (xs - xs.min()) / max(xs.max() - xs.min(), 1e-6)
+    yn = (ys - ys.min()) / max(ys.max() - ys.min(), 1e-6)
     height = yn if flip_y else 1.0 - yn
     band_idx = np.minimum((xn * N_BANDS).astype(int), N_BANDS - 1)
+    c = types.SimpleNamespace(
+        n=len(ids), xn=xn, yn=yn, xmm=xs, ymm=ys,
+        height=height, band_idx=band_idx, state={},
+    )
 
+    render = MODES[mode]
     cap = LoopbackCapture()
-    band_levels = make_band_fn(cap.rate)
-    peak = 1e-3
-    smooth = np.zeros(N_BANDS)
-    bass_avg = 0.0
-    hue = 0.0
-    flash = 0.0
-    last_beat = 0.0
+    an = Analyzer(cap.rate)
     frame = max(kb.min_interval, 1 / 30)
-    print("Running. Press Ctrl+C to stop.")
+    last = time.time()
+    print(f"Mode: {mode}. Running. Press Ctrl+C to stop.")
 
     try:
         while True:
             t0 = time.time()
-            lv = band_levels(cap.snapshot())
-            peak = max(peak * 0.995, lv.max(), 1e-3)
-            norm = np.sqrt(np.clip(lv / peak, 0, 1))
-            smooth = np.where(norm > smooth, smooth + (norm - smooth) * ATTACK, smooth * DECAY)
-
-            # Beat detection on the bass bands
-            bass = float(lv[:4].mean())
-            if bass > bass_avg * BEAT_RATIO and bass > 0.2 * peak and t0 - last_beat > 0.18:
-                hue = (hue + HUE_STEP) % 1.0
-                flash = 1.0
-                last_beat = t0
-            bass_avg = bass_avg * 0.93 + bass * 0.07
-            flash *= FLASH_DECAY
-            hue = (hue + HUE_DRIFT) % 1.0
-
-            level = smooth[band_idx] * BAR_SCALE
-            bars = np.clip((level - height) * 4.0, 0.0, 1.0)
-            value = np.clip(np.maximum(bars, flash * FLASH_STRENGTH), IDLE_GLOW, 1.0)
-            sat = 1.0 - 0.35 * flash  # flash goes slightly whiter
-
-            items = []
-            for lamp_id, x, v in zip(ids, xn, value):
-                r, g, bl = colorsys.hsv_to_rgb((hue + x * HUE_SPREAD) % 1.0, sat, float(v))
-                items.append((lamp_id, int(r * 255), int(g * 255), int(bl * 255)))
+            dt = t0 - last
+            last = t0
+            beat = an.step(cap.snapshot(), t0)
+            rgb = np.clip(render(an, c, beat, t0, dt), 0.0, 1.0)
+            vals = (rgb * 255).astype(int)
+            items = [(lid, int(r), int(g), int(b)) for lid, (r, g, b) in zip(ids, vals)]
             kb.update(items)
-
             time.sleep(max(0.0, frame - (time.time() - t0)))
     finally:
         cap.close()
@@ -263,13 +380,14 @@ def run_audio(kb, pos, flip_y):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--test", action="store_true")
+    ap.add_argument("--mode", choices=list(MODES), default="bars")
     ap.add_argument("--flip-y", action="store_true")
-    ap.add_argument("--feature", action="store_true", help="send updates as feature reports")
+    ap.add_argument("--feature", action="store_true", help=argparse.SUPPRESS)  # no longer needed
     ap.add_argument("--complete-each", action="store_true", help="flag every report as a complete update")
     ap.add_argument("--delay", type=float, default=0.0, help="milliseconds to wait between reports")
     args = ap.parse_args()
 
-    kb = Keyboard(use_feature=args.feature, complete_each=args.complete_each, delay_ms=args.delay)
+    kb = Keyboard(use_feature=True, complete_each=args.complete_each, delay_ms=args.delay)
     try:
         kb.set_autonomous(False)  # take control from the keyboard's built-in effects
         pos = kb.lamp_positions()
@@ -280,7 +398,7 @@ def main():
         if args.test:
             run_test(kb, sorted(pos))
         else:
-            run_audio(kb, pos, args.flip_y)
+            run_audio(kb, pos, args.flip_y, args.mode)
     except KeyboardInterrupt:
         pass
     finally:

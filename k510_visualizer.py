@@ -60,6 +60,7 @@ HUE_STEP = 0.07       # how far the color shifts on each beat (0-1 around the co
 HUE_DRIFT = 0.002     # slow constant color drift per frame
 HUE_SPREAD = 0.25     # how much the color varies left to right
 IDLE_GLOW = 0.03      # faint glow on idle keys (0 = fully off)
+BAR_SCALE = 0.6       # bar height (1.0 = full keyboard height, 0.5 = about half)
 
 
 class Keyboard:
@@ -243,7 +244,7 @@ def run_audio(kb, pos, flip_y):
             flash *= FLASH_DECAY
             hue = (hue + HUE_DRIFT) % 1.0
 
-            level = smooth[band_idx]
+            level = smooth[band_idx] * BAR_SCALE
             bars = np.clip((level - height) * 4.0, 0.0, 1.0)
             value = np.clip(np.maximum(bars, flash * FLASH_STRENGTH), IDLE_GLOW, 1.0)
             sat = 1.0 - 0.35 * flash  # flash goes slightly whiter

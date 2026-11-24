@@ -14,7 +14,7 @@ Run:
     py -3.12 k510_visualizer.py --test       # solid red, green, blue (checks control works)
     py -3.12 k510_visualizer.py              # audio visualizer
     py -3.12 k510_visualizer.py --flip-y     # if the bars grow from the top
-    py -3.12 k510_visualizer.py --feature    # if writing output reports does nothing
+    (--feature is no longer needed; updates always use feature reports)
     --complete-each                         # mark every report as a finished frame
     --delay 2                               # wait 2 ms between reports
 
@@ -93,26 +93,19 @@ class Keyboard:
         return pos
 
     def update(self, items):
-        """items: list of (lamp_id, r, g, b), values 0-255. Sent 8 lamps per report."""
+        """items: list of (lamp_id, r, g, b), values 0-255.
+        This keyboard takes lighting updates as FEATURE report 4, 8 lamps per report,
+        laid out as: id, count, flags, 8 x lamp id (u16), then 8 x (R, G, B, intensity)."""
         for i in range(0, len(items), 8):
             chunk = items[i:i + 8]
             n = len(chunk)
             last = (i + 8) >= len(items)
             pad = 8 - n
             ids = [c[0] for c in chunk] + [0] * pad
-            rr = bytes([c[1] for c in chunk] + [0] * pad)
-            gg = bytes([c[2] for c in chunk] + [0] * pad)
-            bb = bytes([c[3] for c in chunk] + [0] * pad)
-            ii = bytes([255] * n + [0] * pad)
-            buf = (
-                bytes([REPORT_MULTI_UPDATE, n, 1 if (last or self.complete_each) else 0])
-                + struct.pack("<8H", *ids)
-                + rr + gg + bb + ii
-            )
-            if self.use_feature:
-                self.h.send_feature_report(buf)
-            else:
-                self.h.write(buf)
+            rgbi = b"".join(bytes([c[1], c[2], c[3], 255]) for c in chunk) + bytes(4 * pad)
+            flags = 1 if (last or self.complete_each) else 0
+            buf = bytes([REPORT_MULTI_UPDATE, n, flags]) + struct.pack("<8H", *ids) + rgbi
+            self.h.send_feature_report(buf)
             if self.delay:
                 time.sleep(self.delay)
 

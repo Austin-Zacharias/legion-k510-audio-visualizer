@@ -118,7 +118,7 @@ def make_band_fn(rate):
 
 
 async def pick_device(args):
-    infos = await DeviceInformation.find_all_async(LampArray.get_device_selector())
+    infos = await DeviceInformation.find_all_async(LampArray.get_device_selector(), [])
     if not infos:
         print("No Dynamic Lighting (LampArray) devices found.")
         return None

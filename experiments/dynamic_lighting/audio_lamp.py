@@ -174,9 +174,10 @@ async def main():
         while True:
             t0 = time.time()
 
-            if la.is_available != last_avail:
-                last_avail = la.is_available
-                print("Keyboard available to this app:", last_avail)
+            state = (getattr(la, "is_connected", None), la.is_enabled)
+            if state != last_avail:
+                last_avail = state
+                print("Keyboard connected / enabled:", state)
 
             lv = band_levels(cap.snapshot())
             peak = max(peak * 0.995, lv.max(), 1e-3)   # slow auto-gain

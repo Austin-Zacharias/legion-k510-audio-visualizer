@@ -15,6 +15,8 @@ Run:
     py -3.12 k510_visualizer.py              # audio visualizer
     py -3.12 k510_visualizer.py --flip-y     # if the bars grow from the top
     py -3.12 k510_visualizer.py --feature    # if writing output reports does nothing
+    --complete-each                         # mark every report as a finished frame
+    --delay 2                               # wait 2 ms between reports
 
 Press Ctrl+C to stop (the keyboard returns to its normal lighting).
 """
@@ -50,8 +52,10 @@ BUF_SIZE = 4096
 
 
 class Keyboard:
-    def __init__(self, use_feature=False):
+    def __init__(self, use_feature=False, complete_each=False, delay_ms=0.0):
         self.use_feature = use_feature
+        self.complete_each = complete_each
+        self.delay = delay_ms / 1000.0
         cands = [d for d in hid.enumerate(0, 0) if d["usage_page"] == 0x59 and d["usage"] == 0x01]
         if not cands:
             raise RuntimeError("No HID lighting interface (usage page 0x59) found.")
@@ -101,7 +105,7 @@ class Keyboard:
             bb = bytes([c[3] for c in chunk] + [0] * pad)
             ii = bytes([255] * n + [0] * pad)
             buf = (
-                bytes([REPORT_MULTI_UPDATE, n, 1 if last else 0])
+                bytes([REPORT_MULTI_UPDATE, n, 1 if (last or self.complete_each) else 0])
                 + struct.pack("<8H", *ids)
                 + rr + gg + bb + ii
             )
@@ -109,6 +113,8 @@ class Keyboard:
                 self.h.send_feature_report(buf)
             else:
                 self.h.write(buf)
+            if self.delay:
+                time.sleep(self.delay)
 
     def close(self):
         try:
@@ -239,9 +245,11 @@ def main():
     ap.add_argument("--test", action="store_true")
     ap.add_argument("--flip-y", action="store_true")
     ap.add_argument("--feature", action="store_true", help="send updates as feature reports")
+    ap.add_argument("--complete-each", action="store_true", help="flag every report as a complete update")
+    ap.add_argument("--delay", type=float, default=0.0, help="milliseconds to wait between reports")
     args = ap.parse_args()
 
-    kb = Keyboard(use_feature=args.feature)
+    kb = Keyboard(use_feature=args.feature, complete_each=args.complete_each, delay_ms=args.delay)
     try:
         kb.set_autonomous(False)  # take control from the keyboard's built-in effects
         pos = kb.lamp_positions()

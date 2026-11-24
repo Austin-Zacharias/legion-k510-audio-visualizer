@@ -50,6 +50,16 @@ N_BANDS = 24
 FMIN, FMAX = 40, 14000
 BUF_SIZE = 4096
 
+# ---- Look & feel (tweak these) ----
+ATTACK = 0.55         # how fast bars rise (0-1, lower = calmer)
+DECAY = 0.90          # how slowly bars fall (closer to 1 = calmer)
+BEAT_RATIO = 1.4      # bass must exceed its recent average by this factor to count as a beat
+FLASH_STRENGTH = 0.55 # brightness of the whole-keyboard bass flash (0-1)
+FLASH_DECAY = 0.88    # how quickly the flash fades (closer to 1 = longer)
+HUE_STEP = 0.07       # how far the color shifts on each beat (0-1 around the color wheel)
+HUE_DRIFT = 0.002     # slow constant color drift per frame
+HUE_SPREAD = 0.25     # how much the color varies left to right
+
 
 class Keyboard:
     def __init__(self, use_feature=False, complete_each=False, delay_ms=0.0):
@@ -202,12 +212,15 @@ def run_audio(kb, pos, flip_y):
     yn = (ys - ys.min()) / max(ys.max() - ys.min(), 1.0)
     height = yn if flip_y else 1.0 - yn
     band_idx = np.minimum((xn * N_BANDS).astype(int), N_BANDS - 1)
-    hues = xn * 0.8
 
     cap = LoopbackCapture()
     band_levels = make_band_fn(cap.rate)
     peak = 1e-3
     smooth = np.zeros(N_BANDS)
+    bass_avg = 0.0
+    hue = 0.0
+    flash = 0.0
+    last_beat = 0.0
     frame = max(kb.min_interval, 1 / 30)
     print("Running. Press Ctrl+C to stop.")
 
@@ -217,14 +230,26 @@ def run_audio(kb, pos, flip_y):
             lv = band_levels(cap.snapshot())
             peak = max(peak * 0.995, lv.max(), 1e-3)
             norm = np.sqrt(np.clip(lv / peak, 0, 1))
-            smooth = np.maximum(norm, smooth * 0.82)
+            smooth = np.where(norm > smooth, smooth + (norm - smooth) * ATTACK, smooth * DECAY)
+
+            # Beat detection on the bass bands
+            bass = float(lv[:4].mean())
+            if bass > bass_avg * BEAT_RATIO and bass > 0.2 * peak and t0 - last_beat > 0.18:
+                hue = (hue + HUE_STEP) % 1.0
+                flash = 1.0
+                last_beat = t0
+            bass_avg = bass_avg * 0.93 + bass * 0.07
+            flash *= FLASH_DECAY
+            hue = (hue + HUE_DRIFT) % 1.0
 
             level = smooth[band_idx]
-            bright = np.maximum(np.clip((level - height) * 5.0, 0.0, 1.0), 0.03)
+            bars = np.clip((level - height) * 4.0, 0.0, 1.0)
+            value = np.clip(np.maximum(bars, flash * FLASH_STRENGTH), 0.03, 1.0)
+            sat = 1.0 - 0.35 * flash  # flash goes slightly whiter
 
             items = []
-            for lamp_id, h, b in zip(ids, hues, bright):
-                r, g, bl = colorsys.hsv_to_rgb(h, 1.0, b)
+            for lamp_id, x, v in zip(ids, xn, value):
+                r, g, bl = colorsys.hsv_to_rgb((hue + x * HUE_SPREAD) % 1.0, sat, float(v))
                 items.append((lamp_id, int(r * 255), int(g * 255), int(bl * 255)))
             kb.update(items)
 

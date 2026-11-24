@@ -59,6 +59,7 @@ FLASH_DECAY = 0.88    # how quickly the flash fades (closer to 1 = longer)
 HUE_STEP = 0.07       # how far the color shifts on each beat (0-1 around the color wheel)
 HUE_DRIFT = 0.002     # slow constant color drift per frame
 HUE_SPREAD = 0.25     # how much the color varies left to right
+IDLE_GLOW = 0.03      # faint glow on idle keys (0 = fully off)
 
 
 class Keyboard:
@@ -244,7 +245,7 @@ def run_audio(kb, pos, flip_y):
 
             level = smooth[band_idx]
             bars = np.clip((level - height) * 4.0, 0.0, 1.0)
-            value = np.clip(np.maximum(bars, flash * FLASH_STRENGTH), 0.03, 1.0)
+            value = np.clip(np.maximum(bars, flash * FLASH_STRENGTH), IDLE_GLOW, 1.0)
             sat = 1.0 - 0.35 * flash  # flash goes slightly whiter
 
             items = []
